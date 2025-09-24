@@ -5,8 +5,8 @@ echo "📁 بررسی ساختار فایل‌ها:"
 ls -la
 
 echo "🔍 بررسی وجود فایل bot.py:"
-if [ -f "bot.py" ]; then
-    echo "✅ فایل bot.py پیدا شد"
+if [ -f "Todo_Task_bot.py" ]; then
+    echo "✅ فایل Todo_Task_bot.py پیدا شد"
 else
     echo "❌ فایل Todo_Task_bot.py پیدا نشد"
     echo "📋 لیست کامل فایل‌ها:"
