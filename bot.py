@@ -4,7 +4,7 @@ import psycopg2
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Set
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -23,8 +23,32 @@ from telegram.ext import (
 # -----------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "")  # e.g. "123,456"
-ADMINS: List[int] = [int(x.strip()) for x in ADMIN_IDS_ENV.split(",") if x.strip().isdigit()]
+
+def _parse_csv(env_val: Optional[str]) -> List[str]:
+    if not env_val:
+        return []
+    return [x.strip() for x in env_val.split(",") if x.strip()]
+
+# Accept both ADMIN_IDS and ADMIN_ID for convenience
+_ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS") or os.environ.get("ADMIN_ID") or ""
+_ADMIN_USERNAMES_ENV = os.environ.get("ADMIN_USERNAMES", "")  # e.g. "mohammad,alice42"
+
+def _parse_admin_ids(raw: str) -> Set[int]:
+    out: Set[int] = set()
+    for tok in _parse_csv(raw):
+        try:
+            out.add(int(tok))
+        except ValueError:
+            # ignore non-numeric tokens silently
+            pass
+    return out
+
+def _parse_admin_usernames(raw: str) -> Set[str]:
+    # store lowercase without leading @
+    return {tok.lower().lstrip("@") for tok in _parse_csv(raw)}
+
+ADMINS_BY_ID: Set[int] = _parse_admin_ids(_ADMIN_IDS_ENV)
+ADMINS_BY_USERNAME: Set[str] = _parse_admin_usernames(_ADMIN_USERNAMES_ENV)
 
 # Thread pool for blocking DB calls
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
@@ -33,19 +57,20 @@ EXECUTOR = ThreadPoolExecutor(max_workers=8)
 # -----------------------------
 # Utilities
 # -----------------------------
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
+def is_admin(user_id: int, username: Optional[str]) -> bool:
+    if user_id in ADMINS_BY_ID:
+        return True
+    if username and username.lower() in ADMINS_BY_USERNAME:
+        return True
+    return False
 
 def esc(s: Optional[str]) -> str:
     """HTML-escape user-provided text (None-safe)."""
     return html.escape(s or "")
 
-
 def clip(s: str, n: int) -> str:
     """Clip string to n chars and add ellipsis if needed."""
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
-
 
 async def safe_edit_or_send(
     update: Update,
@@ -55,7 +80,7 @@ async def safe_edit_or_send(
 ):
     """
     Edit the existing message if provided; otherwise send a new message.
-    Avoids failing on 'message is not modified'.
+    Avoids failing on 'message is not modified' and markdown/HTML quirks.
     """
     try:
         if message:
@@ -72,8 +97,8 @@ async def safe_edit_or_send(
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-    except BadRequest as e:
-        # Fallback to sending a new message (covers 'message is not modified' and odd edit errors)
+    except BadRequest:
+        # Fallback to sending a fresh message
         await update.effective_chat.send_message(
             text,
             reply_markup=reply_markup,
@@ -88,7 +113,6 @@ async def safe_edit_or_send(
 def _get_conn():
     # Railway Postgres typically requires SSL; keep require. Change if your DB doesn't.
     return psycopg2.connect(DATABASE_URL, sslmode="require")
-
 
 def _init_db_sync():
     with _get_conn() as conn, conn.cursor() as c:
@@ -117,7 +141,6 @@ def _init_db_sync():
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);")
 
-
 def _register_user_sync(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
     with _get_conn() as conn, conn.cursor() as c:
         c.execute(
@@ -132,21 +155,17 @@ def _register_user_sync(user_id: int, username: Optional[str], first_name: Optio
             (user_id, username, first_name, last_name),
         )
 
-
 def _add_task_sync(admin_id: int, user_id: int, task_text: str):
     with _get_conn() as conn, conn.cursor() as c:
         c.execute("INSERT INTO tasks (admin_id, user_id, task_text) VALUES (%s, %s, %s)", (admin_id, user_id, task_text))
-
 
 def _toggle_task_sync(task_id: int, user_id: int):
     with _get_conn() as conn, conn.cursor() as c:
         c.execute("UPDATE tasks SET is_done = NOT is_done WHERE task_id = %s AND user_id = %s", (task_id, user_id))
 
-
 def _delete_task_sync(task_id: int):
     with _get_conn() as conn, conn.cursor() as c:
         c.execute("DELETE FROM tasks WHERE task_id = %s", (task_id,))
-
 
 def _get_user_tasks_sync(user_id: int) -> List[Tuple[int, str, bool, datetime]]:
     with _get_conn() as conn, conn.cursor() as c:
@@ -160,7 +179,6 @@ def _get_user_tasks_sync(user_id: int) -> List[Tuple[int, str, bool, datetime]]:
             (user_id,),
         )
         return c.fetchall()
-
 
 def _get_all_users_sync(offset: int = 0, limit: int = 10) -> List[Tuple[int, Optional[str], Optional[str], int, int]]:
     with _get_conn() as conn, conn.cursor() as c:
@@ -179,12 +197,10 @@ def _get_all_users_sync(offset: int = 0, limit: int = 10) -> List[Tuple[int, Opt
         )
         return c.fetchall()
 
-
 def _get_users_count_sync() -> int:
     with _get_conn() as conn, conn.cursor() as c:
         c.execute("SELECT COUNT(*) FROM users")
         return c.fetchone()[0]
-
 
 def _get_global_stats_sync():
     with _get_conn() as conn, conn.cursor() as c:
@@ -199,7 +215,6 @@ def _get_global_stats_sync():
         users_cnt, tasks_cnt, done_cnt = c.fetchone()
         return users_cnt, tasks_cnt, done_cnt
 
-
 async def run_db(func, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(EXECUTOR, func, *args)
@@ -212,7 +227,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
     user = update.effective_user
     await run_db(_register_user_sync, user.id, user.username, user.first_name, user.last_name)
 
-    if is_admin(user.id):
+    if is_admin(user.id, user.username):
         keyboard = [
             [InlineKeyboardButton("👥 Manage Users", callback_data="admin_users:0")],
             [InlineKeyboardButton("📊 Global Stats", callback_data="admin_stats")],
@@ -232,21 +247,37 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
 
     await safe_edit_or_send(update, text, InlineKeyboardMarkup(keyboard), message)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update, context)
-
 
 async def mytasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_user_tasks_menu(update, update.effective_user.id)
 
-
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user = update.effective_user
+    if not is_admin(user.id, user.username):
         await update.message.reply_text("❌ Access denied.")
         return
     await show_admin_users_menu(update, page=0)
 
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(
+        f"ID: <code>{u.id}</code>\nUsername: <code>{esc(u.username or '')}</code>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+async def amadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    verdict = is_admin(u.id, u.username)
+    await update.message.reply_text(
+        f"Admin: <b>{'YES' if verdict else 'NO'}</b>\n"
+        f"ID matched: <b>{'YES' if u.id in ADMINS_BY_ID else 'NO'}</b>\n"
+        f"Username matched: <b>{'YES' if (u.username or '').lower() in ADMINS_BY_USERNAME else 'NO'}</b>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 async def show_user_tasks_menu(update: Update, user_id: int, message=None):
     tasks = await run_db(_get_user_tasks_sync, user_id)
@@ -263,7 +294,6 @@ async def show_user_tasks_menu(update: Update, user_id: int, message=None):
     lines = [f"📋 <b>Your Tasks</b>\n", f"📊 Status: ✅ {done} done | ⏳ {pending} pending\n"]
     keyboard = []
 
-    # Soft-cap to avoid Telegram 4096-character limit
     for task_id, task_text, is_done, created_date in tasks[:40]:
         emoji = "✅" if is_done else "⏳"
         created_str = created_date.strftime("%Y-%m-%d %H:%M")
@@ -274,7 +304,6 @@ async def show_user_tasks_menu(update: Update, user_id: int, message=None):
 
     keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")])
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
-
 
 async def show_admin_users_menu(update: Update, message=None, page: int = 0, per_page: int = 8):
     total_users = await run_db(_get_users_count_sync)
@@ -308,9 +337,7 @@ async def show_admin_users_menu(update: Update, message=None, page: int = 0, per
         keyboard.append(nav_row)
 
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
-
 
 async def show_user_detail(update: Update, user_id: int, message=None):
     tasks = await run_db(_get_user_tasks_sync, user_id)
@@ -331,7 +358,6 @@ async def show_user_detail(update: Update, user_id: int, message=None):
     ]
 
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
-
 
 async def show_stats(update: Update, message=None):
     users_cnt, tasks_cnt, done_cnt = await run_db(_get_global_stats_sync)
@@ -362,7 +388,6 @@ async def show_stats(update: Update, message=None):
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
 
-
 async def show_help(update: Update, message=None):
     text = (
         "ℹ️ <b>Task Manager Bot — Help</b>\n\n"
@@ -376,6 +401,8 @@ async def show_help(update: Update, message=None):
         "/start — main menu\n"
         "/mytasks — my tasks\n"
         "/users — user management (admins)\n"
+        "/whoami — show your Telegram ID/username\n"
+        "/amadmin — check admin recognition\n"
     )
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
     await safe_edit_or_send(update, text, InlineKeyboardMarkup(keyboard), message)
@@ -387,6 +414,7 @@ async def show_help(update: Update, message=None):
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    username = query.from_user.username
     data = query.data
 
     await query.answer()
@@ -402,16 +430,20 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_user_tasks_menu(update, user_id, query.message)
 
     elif data.startswith("admin_users"):
-        if is_admin(user_id):
+        if is_admin(user_id, username):
             page = 0
             if ":" in data:
                 _, p = data.split(":")
                 page = int(p)
             await show_admin_users_menu(update, query.message, page=page)
+        else:
+            await query.message.reply_text("❌ Access denied.")
 
     elif data == "admin_stats":
-        if is_admin(user_id):
+        if is_admin(user_id, username):
             await show_stats(update, query.message)
+        else:
+            await query.message.reply_text("❌ Access denied.")
 
     elif data == "my_stats":
         await show_user_tasks_menu(update, user_id, query.message)
@@ -430,12 +462,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_user_tasks_menu(update, user_id, query.message)
 
     elif data.startswith("view_user_"):
-        if is_admin(user_id):
+        if is_admin(user_id, username):
             target_user_id = int(data.split("_")[2])
             await show_user_detail(update, target_user_id, query.message)
+        else:
+            await query.message.reply_text("❌ Access denied.")
 
     elif data.startswith("add_task_"):
-        if is_admin(user_id):
+        if is_admin(user_id, username):
             target_user_id = int(data.split("_")[2])
             context.user_data["target_user_id"] = target_user_id
             await query.message.edit_text(
@@ -444,17 +478,20 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+        else:
+            await query.message.reply_text("❌ Access denied.")
 
     elif data.startswith("view_all_tasks_"):
-        if is_admin(user_id):
+        if is_admin(user_id, username):
             target_user_id = int(data.split("_")[3])
             await show_user_tasks_menu(update, target_user_id, query.message)
-
+        else:
+            await query.message.reply_text("❌ Access denied.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle free text when in add-task mode."""
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+    user = update.effective_user
+    if not is_admin(user.id, user.username):
         await update.message.reply_text("❌ Access denied.")
         return
 
@@ -465,7 +502,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❗ Task text is empty.")
             return
 
-        await run_db(_add_task_sync, user_id, target_user_id, task_text)
+        await run_db(_add_task_sync, user.id, target_user_id, task_text)
         context.user_data.pop("target_user_id", None)
 
         await update.message.reply_text(
@@ -483,7 +520,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Log the exception; on Railway logs are visible in dashboard.
-    err = context.error
     try:
         chat = None
         if isinstance(update, Update):
@@ -495,7 +531,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
             )
     except Exception:
-        pass  # Avoid raising from the error handler
+        pass  # Never raise from the error handler
 
 
 # -----------------------------
@@ -503,7 +539,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------
 async def _init_db_once(app: Application):
     await run_db(_init_db_sync)
-
+    # Print admins to stdout for sanity check on Railway
+    print(f"[BOOT] Admin IDs: {sorted(ADMINS_BY_ID)}")
+    print(f"[BOOT] Admin Usernames: {sorted(ADMINS_BY_USERNAME)}")
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -515,6 +553,8 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("mytasks", mytasks_cmd))
     application.add_handler(CommandHandler("users", users_cmd))
+    application.add_handler(CommandHandler("whoami", whoami_cmd))
+    application.add_handler(CommandHandler("amadmin", amadmin_cmd))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(button_click))
