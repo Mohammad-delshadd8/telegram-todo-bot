@@ -122,8 +122,9 @@ def _get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def _init_db_sync():
-    """Create tables and add settings table for per-user preferences."""
+    """Create/upgrade schema in a migration-safe order."""
     with _get_conn() as conn, conn.cursor() as c:
+        # Core tables
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS users(
@@ -143,14 +144,18 @@ def _init_db_sync():
                 user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
                 task_text TEXT,
                 is_done BOOLEAN DEFAULT FALSE,
-                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_daily BOOLEAN DEFAULT TRUE,
-                last_reset DATE DEFAULT CURRENT_DATE,
-                completed_at TIMESTAMP NULL
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                -- NOTE: do not rely on CREATE TABLE to add new columns on existing DBs
             );
             """
         )
-        # Settings table (new)
+
+        # Add new columns idempotently BEFORE creating indexes that depend on them
+        c.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_daily BOOLEAN DEFAULT TRUE;")
+        c.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_reset DATE DEFAULT CURRENT_DATE;")
+        c.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP NULL;")
+
+        # Settings table (per-user preferences)
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS user_settings(
@@ -161,6 +166,8 @@ def _init_db_sync():
             );
             """
         )
+
+        # Indexes (safe to create multiple times with IF NOT EXISTS)
         c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_pending ON tasks(user_id, is_done);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completed_at);")
