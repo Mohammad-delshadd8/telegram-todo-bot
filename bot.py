@@ -8,7 +8,6 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Set, Dict
 
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
@@ -19,7 +18,6 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
-    JobQueue,  # may be missing at runtime; code handles None gracefully
 )
 
 # =============================
@@ -52,6 +50,7 @@ def _parse_admin_ids(raw: str) -> Set[int]:
 def _parse_admin_usernames(raw: str) -> Set[str]:
     return {tok.lower().lstrip("@") for tok in _parse_csv(raw)}
 
+# Bootstrap admins from ENV (protected)
 ADMINS_BY_ID: Set[int] = _parse_admin_ids(_ADMIN_IDS_ENV)
 ADMINS_BY_USERNAME: Set[str] = _parse_admin_usernames(_ADMIN_USERNAMES_ENV)
 
@@ -61,7 +60,7 @@ EXECUTOR = ThreadPoolExecutor(max_workers=8)
 # =============================
 # Utils
 # =============================
-def is_admin(user_id: int, username: Optional[str]) -> bool:
+def is_admin_env(user_id: int, username: Optional[str]) -> bool:
     if user_id in ADMINS_BY_ID:
         return True
     if username and username.lower() in ADMINS_BY_USERNAME:
@@ -162,6 +161,17 @@ def _init_db_sync():
                 mute_reminders BOOLEAN DEFAULT FALSE,
                 work_start SMALLINT DEFAULT 9,   -- inclusive, 0..23
                 work_end SMALLINT DEFAULT 21     -- exclusive, 1..24 (24 means 24/7 with start=0)
+            );
+            """
+        )
+
+        # Dynamic admins table (separate from ENV)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins(
+                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -325,46 +335,54 @@ def _update_user_settings_sync(user_id: int, mute: Optional[bool] = None, start:
         vals.append(user_id)
         c.execute(q, tuple(vals))
 
-def _collect_yesterday_report_and_reset_sync(tz_name: str) -> List[Tuple[int, int, int]]:
-    """Build per-user report for yesterday (in given tz), then reset daily tasks."""
-    tz = ZoneInfo(tz_name)
-    now_local = datetime.now(tz=tz)
-    today_local = now_local.date()
-    yesterday_local = today_local - timedelta(days=1)
-    y_start_local = datetime.combine(yesterday_local, time(0, 0), tzinfo=tz)
-    y_end_local = datetime.combine(today_local, time(0, 0), tzinfo=tz)
-    y_start_utc = y_start_local.astimezone(timezone.utc)
-    y_end_utc = y_end_local.astimezone(timezone.utc)
+# ---------- Dynamic admins (DB) ----------
+def _is_admin_db_sync(user_id: int) -> bool:
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute("SELECT 1 FROM admins WHERE user_id=%s", (user_id,))
+        return c.fetchone() is not None
 
+def _add_admin_sync(target_user_id: int, added_by: int):
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute(
+            "INSERT INTO admins (user_id, added_by) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+            (target_user_id, added_by),
+        )
+
+def _remove_admin_sync(target_user_id: int):
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute("DELETE FROM admins WHERE user_id=%s", (target_user_id,))
+
+def _get_admins_db_detailed_sync() -> List[Tuple[int, Optional[str], Optional[str], Optional[int], Optional[datetime]]]:
+    """Return DB admins joined with user profile info."""
     with _get_conn() as conn, conn.cursor() as c:
         c.execute(
             """
-            SELECT
-                u.user_id,
-                COALESCE(SUM(CASE WHEN t.is_daily THEN 1 ELSE 0 END), 0) AS total_daily,
-                COALESCE(SUM(CASE WHEN t.completed_at >= %s AND t.completed_at < %s THEN 1 ELSE 0 END), 0) AS completed_y
-            FROM users u
-            LEFT JOIN tasks t ON u.user_id = t.user_id
-            GROUP BY u.user_id
-            """,
-            (y_start_utc, y_end_utc),
+            SELECT a.user_id, u.first_name, u.username, a.added_by, a.added_at
+            FROM admins a
+            LEFT JOIN users u ON u.user_id = a.user_id
+            ORDER BY a.added_at DESC
+            """
         )
-        report = c.fetchall()
+        return c.fetchall()
 
-        c.execute(
-            """
-            UPDATE tasks
-            SET is_done = FALSE,
-                last_reset = CURRENT_DATE,
-                completed_at = NULL
-            WHERE is_daily = TRUE
-            """
-        )
-    return [(r[0], int(r[1] or 0), int(r[2] or 0)) for r in report]
+def _get_users_info_sync(user_ids: List[int]) -> Dict[int, Tuple[Optional[str], Optional[str]]]:
+    if not user_ids:
+        return {}
+    with _get_conn() as conn, conn.cursor() as c:
+        q = "SELECT user_id, first_name, username FROM users WHERE user_id = ANY(%s)"
+        c.execute(q, (user_ids,))
+        rows = c.fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 async def run_db(func, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(EXECUTOR, func, *args)
+
+# ---------- Admin check (ENV + DB) ----------
+async def is_admin_async(user_id: int, username: Optional[str]) -> bool:
+    if is_admin_env(user_id, username):
+        return True
+    return await run_db(_is_admin_db_sync, user_id)
 
 # =============================
 # UI / Menus (HTML)
@@ -373,10 +391,11 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
     user = update.effective_user
     await run_db(_ensure_user_and_settings_sync, user.id, user.username, user.first_name, user.last_name)
 
-    if is_admin(user.id, user.username):
+    if await is_admin_async(user.id, user.username):
         keyboard = [
             [InlineKeyboardButton("👥 Manage Users", callback_data="admin_users:0")],
             [InlineKeyboardButton("📊 Global Stats", callback_data="admin_stats")],
+            [InlineKeyboardButton("🔧 Admins", callback_data="admins_menu")],
             [InlineKeyboardButton("✅ My Tasks", callback_data="my_tasks")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
@@ -387,6 +406,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
         pending = sum(1 for t in tasks if not t[2])
         keyboard = [
             [InlineKeyboardButton("✅ My Tasks", callback_data="my_tasks")],
+            [InlineKeyboardButton("➕ New Task", callback_data="add_self_task")],
             [InlineKeyboardButton("📊 My Status", callback_data="my_stats")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
@@ -401,28 +421,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mytasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_user_tasks_menu(update, update.effective_user.id)
 
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Let user add a task for themselves via /add."""
+    context.user_data["adding_self_task"] = True
+    await update.message.reply_text(
+        "✏️ Send me the task text to add it to your list.",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_admin(user.id, user.username):
+    if not await is_admin_async(user.id, user.username):
         await update.message.reply_text("❌ Access denied.")
         return
     await show_admin_users_menu(update, page=0)
 
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    env_id = u.id in ADMINS_BY_ID
+    env_un = (u.username or "").lower() in ADMINS_BY_USERNAME
+    db_admin = await run_db(_is_admin_db_sync, u.id)
     await update.message.reply_text(
-        f"ID: <code>{u.id}</code>\nUsername: <code>{esc(u.username or '')}</code>\nTZ: <code>{esc(TZ_NAME)}</code>",
+        f"ID: <code>{u.id}</code>\n"
+        f"Username: <code>{esc(u.username or '')}</code>\n"
+        f"TZ: <code>{esc(TZ_NAME)}</code>\n"
+        f"Admin (env/db): <b>{'YES' if (env_id or env_un or db_admin) else 'NO'}</b>\n"
+        f" - env:id: <b>{'YES' if env_id else 'NO'}</b>\n"
+        f" - env:username: <b>{'YES' if env_un else 'NO'}</b>\n"
+        f" - db: <b>{'YES' if db_admin else 'NO'}</b>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
 
 async def amadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    verdict = is_admin(u.id, u.username)
+    verdict = await is_admin_async(u.id, u.username)
     await update.message.reply_text(
-        f"Admin: <b>{'YES' if verdict else 'NO'}</b>\n"
-        f"ID matched: <b>{'YES' if u.id in ADMINS_BY_ID else 'NO'}</b>\n"
-        f"Username matched: <b>{'YES' if (u.username or '').lower() in ADMINS_BY_USERNAME else 'NO'}</b>",
+        f"Admin: <b>{'YES' if verdict else 'NO'}</b>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -433,9 +469,11 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_user_tasks_menu(update: Update, user_id: int, message=None):
     tasks = await run_db(_get_user_tasks_sync, user_id)
     if not tasks:
-        text = "🎉 <b>No tasks!</b>\n\nYou’re all caught up."
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
-        await safe_edit_or_send(update, text, InlineKeyboardMarkup(keyboard), message)
+        keyboard = []
+        if update.effective_user.id == user_id:
+            keyboard.append([InlineKeyboardButton("➕ New Task", callback_data="add_self_task")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+        await safe_edit_or_send(update, "🎉 <b>No tasks!</b>\n\nYou’re all caught up.", InlineKeyboardMarkup(keyboard), message)
         return
 
     pending = sum(1 for t in tasks if not t[2])
@@ -443,6 +481,7 @@ async def show_user_tasks_menu(update: Update, user_id: int, message=None):
 
     lines = [f"📋 <b>Your Tasks</b>\n", f"📊 Status: ✅ {done} done | ⏳ {pending} pending\n"]
     keyboard = []
+
     for task_id, task_text, is_done, created_date in tasks[:40]:
         emoji = "✅" if is_done else "⏳"
         created_str = created_date.strftime("%Y-%m-%d %H:%M")
@@ -450,6 +489,9 @@ async def show_user_tasks_menu(update: Update, user_id: int, message=None):
         label = f"{'✅ Done' if not is_done else '↩️ Undo'}: {clip(task_text, 15)}"
         cb = f"{'complete' if not is_done else 'undo'}_{task_id}"
         keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+
+    if update.effective_user.id == user_id:
+        keyboard.insert(0, [InlineKeyboardButton("➕ New Task", callback_data="add_self_task")])
 
     keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")])
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
@@ -461,6 +503,7 @@ async def show_admin_users_menu(update: Update, message=None, page: int = 0, per
 
     lines = ["👥 <b>User Management</b>\n"]
     keyboard = []
+
     for user_id, first_name, username, task_count, done_count in users:
         uname = f"@{username}" if username else "no-username"
         progress = f"{done_count}/{task_count}" if task_count > 0 else "0"
@@ -469,10 +512,12 @@ async def show_admin_users_menu(update: Update, message=None, page: int = 0, per
             f"   📊 Progress: {esc(progress)} | 🆔: <code>{user_id}</code>\n"
             f"   ─────────────────"
         )
-        keyboard.append([
-            InlineKeyboardButton(f"👀 View {clip(first_name or str(user_id), 12)}", callback_data=f"view_user_{user_id}"),
-            InlineKeyboardButton("➕ New Task", callback_data=f"add_task_{user_id}"),
-        ])
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"👀 View {clip(first_name or str(user_id), 12)}", callback_data=f"view_user_{user_id}"),
+                InlineKeyboardButton("➕ New Task", callback_data=f"add_task_{user_id}"),
+            ]
+        )
 
     nav_row = []
     if page > 0:
@@ -489,6 +534,17 @@ async def show_user_detail(update: Update, user_id: int, message=None):
     tasks = await run_db(_get_user_tasks_sync, user_id)
     user_tasks = [t for t in tasks if not t[2]]
 
+    # Admin toggle button
+    is_db_admin = await run_db(_is_admin_db_sync, user_id)
+    is_env_protected = user_id in ADMINS_BY_ID  # ENV admins are protected
+    if is_env_protected:
+        admin_btn = InlineKeyboardButton("🛡 Admin (ENV)", callback_data="noop")
+    else:
+        admin_btn = InlineKeyboardButton(
+            "⬆️ Grant Admin" if not is_db_admin else "⬇️ Revoke Admin",
+            callback_data=f"toggle_admin_{user_id}"
+        )
+
     lines = [f"👤 <b>User Detail</b>\n", f"🆔 ID: <code>{user_id}</code>", f"📊 Active tasks: <b>{len(user_tasks)}</b>\n"]
     if user_tasks:
         lines.append("📋 <b>Pending tasks:</b>")
@@ -500,7 +556,41 @@ async def show_user_detail(update: Update, user_id: int, message=None):
     keyboard = [
         [InlineKeyboardButton("➕ Add Task", callback_data=f"add_task_{user_id}")],
         [InlineKeyboardButton("📊 View all tasks", callback_data=f"view_all_tasks_{user_id}")],
+        [admin_btn],
         [InlineKeyboardButton("🔙 Back", callback_data="admin_users:0")],
+    ]
+
+    await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
+
+async def show_admins_menu(update: Update, message=None):
+    """Show current admins: ENV (protected) + DB (removable)."""
+    db_admins = await run_db(_get_admins_db_detailed_sync)
+    env_ids = sorted(list(ADMINS_BY_ID))
+    env_infos = await run_db(_get_users_info_sync, env_ids)
+
+    lines = ["🔧 <b>Admins</b>\n"]
+
+    if env_ids:
+        lines.append("🛡 <b>ENV Admins (protected)</b>")
+        for uid in env_ids:
+            name, un = env_infos.get(uid, (None, None))
+            label = f"{esc(name) or uid} ({'@'+un if un else 'no-username'})"
+            lines.append(f"• {label}")
+        lines.append("")
+
+    if db_admins:
+        lines.append("🧩 <b>DB Admins</b>")
+        for uid, first_name, username, added_by, added_at in db_admins:
+            label = f"{esc(first_name) or uid} ({'@'+username if username else 'no-username'})"
+            meta = f"added_by={added_by} at {added_at.strftime('%Y-%m-%d %H:%M') if added_at else '-'}"
+            lines.append(f"• {label} — <i>{meta}</i>")
+        lines.append("")
+    else:
+        lines.append("No DB admins yet.\n")
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Admin by ID", callback_data="admin_add_by_id")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
     ]
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
 
@@ -537,17 +627,21 @@ async def show_help(update: Update, message=None):
         "ℹ️ <b>Task Manager Bot — Help</b>\n\n"
         "🎯 <b>Users:</b>\n"
         "• ✅ My Tasks — view & toggle tasks\n"
+        "• ➕ New Task — add a task for yourself\n"
         "• 📊 My Status — quick stats\n"
         "• ⚙️ Settings — mute reminders & working hours\n\n"
         "👑 <b>Admins:</b>\n"
         "• 👥 Manage Users — browse users, add tasks\n"
+        "• 🔧 Admins — view/add/remove DB admins\n"
         "• 📊 Global Stats — overall metrics\n\n"
         "⌨️ <b>Commands:</b>\n"
         "/start — main menu\n"
         "/mytasks — my tasks\n"
+        "/add — add a new task for yourself\n"
         "/users — user management (admins)\n"
+        "/admins — admins overview (admins)\n"
         "/settings — user settings\n"
-        "/whoami — show your Telegram ID/username\n"
+        "/whoami — show your Telegram info\n"
         "/amadmin — check admin recognition\n"
     )
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
@@ -598,8 +692,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    if data in ("main_menu", "admin_stats", "help", "settings") or data.startswith("admin_users"):
+    # Clear state on navigation
+    if data in ("main_menu", "admin_stats", "help", "settings", "admins_menu") or data.startswith("admin_users"):
         context.user_data.pop("target_user_id", None)
+        context.user_data.pop("awaiting_admin_id", None)
+        context.user_data.pop("adding_self_task", None)
 
     if data == "main_menu":
         await show_main_menu(update, context, query.message)
@@ -607,8 +704,17 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "my_tasks":
         await show_user_tasks_menu(update, user_id, query.message)
 
+    elif data == "add_self_task":
+        context.user_data["adding_self_task"] = True
+        await query.message.edit_text(
+            "✏️ Send the task text to add it to <b>your</b> list:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="my_tasks")]]),
+            disable_web_page_preview=True,
+        )
+
     elif data.startswith("admin_users"):
-        if is_admin(user_id, username):
+        if await is_admin_async(user_id, username):
             page = 0
             if ":" in data:
                 _, p = data.split(":")
@@ -618,8 +724,26 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Access denied.")
 
     elif data == "admin_stats":
-        if is_admin(user_id, username):
+        if await is_admin_async(user_id, username):
             await show_stats(update, query.message)
+        else:
+            await query.message.reply_text("❌ Access denied.")
+
+    elif data == "admins_menu":
+        if await is_admin_async(user_id, username):
+            await show_admins_menu(update, query.message)
+        else:
+            await query.message.reply_text("❌ Access denied.")
+
+    elif data == "admin_add_by_id":
+        if await is_admin_async(user_id, username):
+            context.user_data["awaiting_admin_id"] = True
+            await query.message.edit_text(
+                "👤 Send the numeric <b>Telegram user ID</b> to grant admin.\nExample: <code>123456789</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admins_menu")]]),
+                disable_web_page_preview=True,
+            )
         else:
             await query.message.reply_text("❌ Access denied.")
 
@@ -643,14 +767,30 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_user_tasks_menu(update, user_id, query.message)
 
     elif data.startswith("view_user_"):
-        if is_admin(user_id, username):
+        if await is_admin_async(user_id, username):
             target_user_id = int(data.split("_")[2])
             await show_user_detail(update, target_user_id, query.message)
         else:
             await query.message.reply_text("❌ Access denied.")
 
+    elif data.startswith("toggle_admin_"):
+        if await is_admin_async(user_id, username):
+            target_user_id = int(data.split("_")[2])
+            if target_user_id in ADMINS_BY_ID:
+                await query.message.reply_text("🛡 This admin is protected by ENV and cannot be removed.")
+            else:
+                if await run_db(_is_admin_db_sync, target_user_id):
+                    await run_db(_remove_admin_sync, target_user_id)
+                    await query.message.reply_text(f"✅ Admin revoked for <code>{target_user_id}</code>.", parse_mode=ParseMode.HTML)
+                else:
+                    await run_db(_add_admin_sync, target_user_id, user_id)
+                    await query.message.reply_text(f"✅ Admin granted to <code>{target_user_id}</code>.", parse_mode=ParseMode.HTML)
+            await show_user_detail(update, target_user_id, query.message)
+        else:
+            await query.message.reply_text("❌ Access denied.")
+
     elif data.startswith("add_task_"):
-        if is_admin(user_id, username):
+        if await is_admin_async(user_id, username):
             target_user_id = int(data.split("_")[2])
             context.user_data["target_user_id"] = target_user_id
             await query.message.edit_text(
@@ -663,79 +803,85 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Access denied.")
 
     elif data.startswith("view_all_tasks_"):
-        if is_admin(user_id, username):
+        if await is_admin_async(user_id, username):
             target_user_id = int(data.split("_")[3])
             await show_user_tasks_menu(update, target_user_id, query.message)
         else:
             await query.message.reply_text("❌ Access denied.")
 
-    # Settings actions
-    elif data == "toggle_mute":
-        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
-        await run_db(_update_user_settings_sync, user_id, not mute, None, None)
-        await show_settings_menu(update, query.message)
-
-    elif data == "start_inc":
-        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
-        await run_db(_update_user_settings_sync, user_id, None, (start_h + 1) % 24, None)
-        await show_settings_menu(update, query.message)
-
-    elif data == "start_dec":
-        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
-        await run_db(_update_user_settings_sync, user_id, None, (start_h - 1) % 24, None)
-        await show_settings_menu(update, query.message)
-
-    elif data == "end_inc":
-        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
-        end_h = (end_h + 1) % 25
-        end_h = 24 if end_h == 0 else end_h
-        await run_db(_update_user_settings_sync, user_id, None, None, end_h)
-        await show_settings_menu(update, query.message)
-
-    elif data == "end_dec":
-        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
-        end_h = end_h - 1
-        if end_h < 1:
-            end_h = 24
-        await run_db(_update_user_settings_sync, user_id, None, None, end_h)
-        await show_settings_menu(update, query.message)
-
-    elif data == "preset_9_21":
-        await run_db(_update_user_settings_sync, user_id, None, 9, 21)
-        await show_settings_menu(update, query.message)
-
-    elif data == "preset_24_7":
-        await run_db(_update_user_settings_sync, user_id, None, 0, 24)
-        await show_settings_menu(update, query.message)
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle free text when in add-task mode."""
-    user = update.effective_user
-    if not is_admin(user.id, user.username):
-        await update.message.reply_text("❌ Access denied.")
-        return
+    """Handle free text for:
+       - admin adding task to a target user
+       - admin adding admin by ID
+       - user adding own task
+    """
+    u = update.effective_user
+    text = (update.message.text or "").strip()
 
-    if "target_user_id" in context.user_data:
-        target_user_id = context.user_data["target_user_id"]
-        task_text = (update.message.text or "").strip()
-        if not task_text:
-            await update.message.reply_text("❗ Task text is empty.")
+    # Admin: add admin by ID
+    if context.user_data.get("awaiting_admin_id"):
+        if not await is_admin_async(u.id, u.username):
+            await update.message.reply_text("❌ Access denied.")
+            context.user_data.pop("awaiting_admin_id", None)
             return
-
-        await run_db(_add_task_sync, user.id, target_user_id, task_text)
-        context.user_data.pop("target_user_id", None)
-
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ Please send a numeric Telegram user ID.")
+            return
+        # Ensure user exists in users table (create stub if needed)
+        await run_db(_ensure_user_and_settings_sync, target_id, None, None, None)
+        await run_db(_add_admin_sync, target_id, u.id)
+        context.user_data.pop("awaiting_admin_id", None)
         await update.message.reply_text(
-            f"✅ Task added.\n\n👤 User: <code>{target_user_id}</code>\n📝 Task: {esc(task_text)}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]]),
+            f"✅ Admin granted to <code>{target_id}</code>.",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        await show_admins_menu(update)
+        return
+
+    # Admin: add task to a target user
+    if "target_user_id" in context.user_data:
+        if not await is_admin_async(u.id, u.username):
+            await update.message.reply_text("❌ Access denied.")
+            return
+        target_user_id = context.user_data["target_user_id"]
+        if not text:
+            await update.message.reply_text("❗ Task text is empty.")
+            return
+        await run_db(_add_task_sync, u.id, target_user_id, text)
+        context.user_data.pop("target_user_id", None)
+        await update.message.reply_text(
+            f"✅ Task added for <code>{target_user_id}</code>.\n📝 {esc(text)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    # User: add task for themselves
+    if context.user_data.get("adding_self_task"):
+        if not text:
+            await update.message.reply_text("❗ Task text is empty.")
+            return
+        await run_db(_add_task_sync, u.id, u.id, text)
+        context.user_data.pop("adding_self_task", None)
+        await update.message.reply_text(
+            f"✅ Task added to <b>your</b> list.\n📝 {esc(text)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open My Tasks", callback_data="my_tasks")]])
+        )
+        return
+
+    # Fallback
+    if await is_admin_async(u.id, u.username):
+        await update.message.reply_text("ℹ️ Use the menu to manage users/admins or send a task after selecting a target.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("ℹ️ Use menu buttons to add tasks.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("ℹ️ Use the menu. Tip: press “➕ New Task” to add one.", parse_mode=ParseMode.HTML)
 
 # =============================
-# Jobs (PTB JobQueue + asyncio fallback)
+# Jobs (asyncio fallback scheduler)
 # =============================
 async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Every 2 hours: ping users with pending tasks, respecting settings."""
@@ -747,9 +893,7 @@ async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
 
         for user_id, count_pending, samples in pending_list:
             mute, w_start, w_end = settings_map.get(user_id, (False, 9, 21))
-            if mute:
-                continue
-            if not _within_hours(now_local, w_start, w_end):
+            if mute or not _within_hours(now_local, w_start, w_end):
                 continue
             try:
                 lines = [
@@ -803,7 +947,6 @@ async def job_midnight_rollover(context: ContextTypes.DEFAULT_TYPE):
             except (Forbidden, BadRequest):
                 continue
 
-        # Optional admin aggregate
         admins = list(ADMINS_BY_ID)
         if admins:
             total_users = await run_db(_get_users_count_sync)
@@ -830,10 +973,8 @@ async def job_midnight_rollover(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ---------- AsyncIO fallback scheduling ----------
-
 def _seconds_until_next_even_hour(now_local: datetime) -> float:
-    """Compute seconds until the next even-hour at minute 00 in local TZ."""
+    """Seconds until the next even-hour at minute 00 in local TZ."""
     hour = now_local.hour
     next_hour = (hour + (2 - (hour % 2))) % 24
     day = now_local.date()
@@ -844,7 +985,6 @@ def _seconds_until_next_even_hour(now_local: datetime) -> float:
     return max(1.0, delta)
 
 def _seconds_until_local(h: int, m: int, now_local: Optional[datetime] = None) -> float:
-    """Compute seconds until the next occurrence of local time h:m."""
     now_local = now_local or datetime.now(tz=TZ)
     candidate = datetime.combine(now_local.date(), time(h, m), tzinfo=TZ)
     if candidate <= now_local:
@@ -852,7 +992,7 @@ def _seconds_until_local(h: int, m: int, now_local: Optional[datetime] = None) -
     return max(1.0, (candidate - now_local).total_seconds())
 
 async def _reminders_loop(app: Application):
-    """Fallback loop that runs reminders every 2 hours at :00 in local TZ."""
+    """AsyncIO loop: reminders every 2 hours at :00 local time."""
     print("[SCHED] AsyncIO reminders loop active")
     ctx = SimpleNamespace(application=app)
     while True:
@@ -865,7 +1005,7 @@ async def _reminders_loop(app: Application):
             pass
 
 async def _midnight_loop(app: Application):
-    """Fallback loop that runs the daily rollover at 00:05 local TZ."""
+    """AsyncIO loop: daily rollover at 00:05 local time."""
     print("[SCHED] AsyncIO midnight loop active")
     ctx = SimpleNamespace(application=app)
     while True:
@@ -876,29 +1016,11 @@ async def _midnight_loop(app: Application):
         except Exception:
             pass
 
-def _schedule_jobs(job_queue: Optional[JobQueue], app: Application):
-    """Schedule jobs via PTB JobQueue if available; otherwise use asyncio fallback."""
-    if job_queue is not None:
-        # PTB JobQueue path (requires 'python-telegram-bot[job-queue]')
-        print("[SCHED] Using PTB JobQueue")
-        # Reminders at every even hour local time
-        for h in range(0, 24, 2):
-            job_queue.run_daily(
-                job_send_reminders,
-                time=time(hour=h, minute=0, tzinfo=TZ),
-                name=f"reminder_{h:02d}",
-            )
-        # Midnight rollover 00:05 local
-        job_queue.run_daily(
-            job_midnight_rollover,
-            time=time(hour=0, minute=5, tzinfo=TZ),
-            name="midnight_rollover",
-        )
-    else:
-        # AsyncIO fallback loops
-        print("[SCHED] PTB JobQueue not available — using AsyncIO fallback")
-        app.create_task(_reminders_loop(app), name="reminders_loop")
-        app.create_task(_midnight_loop(app), name="midnight_loop")
+def _schedule_asyncio_loops(app: Application):
+    """Start background loops (no PTB JobQueue required)."""
+    loop = asyncio.get_running_loop()
+    loop.create_task(_reminders_loop(app), name="reminders_loop")
+    loop.create_task(_midnight_loop(app), name="midnight_loop")
 
 # =============================
 # Error handling
@@ -920,23 +1042,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =============================
 # App bootstrap
 # =============================
-async def _init_db_once(app: Application):
+async def _post_init(app: Application):
     await run_db(_init_db_sync)
     print(f"[BOOT] TZ={TZ_NAME}")
-    print(f"[BOOT] Admin IDs: {sorted(ADMINS_BY_ID)}")
-    print(f"[BOOT] Admin Usernames: {sorted(ADMINS_BY_USERNAME)}")
-    _schedule_jobs(getattr(app, "job_queue", None), app)
+    print(f"[BOOT] Admin IDs (ENV): {sorted(ADMINS_BY_ID)}")
+    print(f"[BOOT] Admin Usernames (ENV): {sorted(ADMINS_BY_USERNAME)}")
+    _schedule_asyncio_loops(app)
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Initialize DB and schedule jobs after startup
-    application.post_init = _init_db_once
+    # Initialize DB and start background schedulers after init
+    application.post_init = _post_init
 
     # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("mytasks", mytasks_cmd))
+    application.add_handler(CommandHandler("add", add_cmd))
     application.add_handler(CommandHandler("users", users_cmd))
+    application.add_handler(CommandHandler("admins", show_admins_menu))
     application.add_handler(CommandHandler("settings", settings_cmd))
     application.add_handler(CommandHandler("whoami", whoami_cmd))
     application.add_handler(CommandHandler("amadmin", amadmin_cmd))
