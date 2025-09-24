@@ -8,7 +8,7 @@ echo "🔍 بررسی وجود فایل bot.py:"
 if [ -f "bot.py" ]; then
     echo "✅ فایل bot.py پیدا شد"
 else
-    echo "❌ فایل bot.py پیدا نشد"
+    echo "❌ فایل Todo_Task_bot.py پیدا نشد"
     echo "📋 لیست کامل فایل‌ها:"
     find . -type f -name "*.py" | head -20
     exit 1
@@ -21,4 +21,4 @@ echo "📦 نصب dependencies:"
 pip install -r requirements.txt
 
 echo "🚀 راه‌اندازی ربات..."
-python bot.py
+python Todo_Task_bot.py
