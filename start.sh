@@ -1,4 +1,5 @@
 #!/bin/bash
+rm -rf /app 
 mkdir app 
 cp * /app 
 
