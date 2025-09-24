@@ -3,7 +3,7 @@ import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_TOKEN = os.environ['AAEcP39PX6mLgngUsJrdUR2J2KYO93D9Z0g']
+BOT_TOKEN = os.environ['BOT_TOKEN']
 
 # admin lists 
 ADMINS = [780949018]  
