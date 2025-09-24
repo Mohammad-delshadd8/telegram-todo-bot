@@ -2,13 +2,16 @@ import os
 import html
 import psycopg2
 import asyncio
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import List, Tuple, Optional, Set
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import List, Tuple, Optional, Set, Dict
+
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,22 +19,26 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
+    JobQueue,  # may be missing at runtime; code handles None gracefully
 )
 
-# -----------------------------
-# Config
-# -----------------------------
+# =============================
+# Config & Admin parsing
+# =============================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
+
+# Default local timezone (Iran). Can be overridden by env TZ.
+TZ_NAME = os.environ.get("TZ", "Asia/Tehran")
+TZ = ZoneInfo(TZ_NAME)
 
 def _parse_csv(env_val: Optional[str]) -> List[str]:
     if not env_val:
         return []
     return [x.strip() for x in env_val.split(",") if x.strip()]
 
-# Accept both ADMIN_IDS and ADMIN_ID for convenience
 _ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS") or os.environ.get("ADMIN_ID") or ""
-_ADMIN_USERNAMES_ENV = os.environ.get("ADMIN_USERNAMES", "")  # e.g. "mohammad,alice42"
+_ADMIN_USERNAMES_ENV = os.environ.get("ADMIN_USERNAMES", "")
 
 def _parse_admin_ids(raw: str) -> Set[int]:
     out: Set[int] = set()
@@ -39,12 +46,10 @@ def _parse_admin_ids(raw: str) -> Set[int]:
         try:
             out.add(int(tok))
         except ValueError:
-            # ignore non-numeric tokens silently
             pass
     return out
 
 def _parse_admin_usernames(raw: str) -> Set[str]:
-    # store lowercase without leading @
     return {tok.lower().lstrip("@") for tok in _parse_csv(raw)}
 
 ADMINS_BY_ID: Set[int] = _parse_admin_ids(_ADMIN_IDS_ENV)
@@ -53,10 +58,9 @@ ADMINS_BY_USERNAME: Set[str] = _parse_admin_usernames(_ADMIN_USERNAMES_ENV)
 # Thread pool for blocking DB calls
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
 
-
-# -----------------------------
-# Utilities
-# -----------------------------
+# =============================
+# Utils
+# =============================
 def is_admin(user_id: int, username: Optional[str]) -> bool:
     if user_id in ADMINS_BY_ID:
         return True
@@ -65,23 +69,29 @@ def is_admin(user_id: int, username: Optional[str]) -> bool:
     return False
 
 def esc(s: Optional[str]) -> str:
-    """HTML-escape user-provided text (None-safe)."""
     return html.escape(s or "")
 
 def clip(s: str, n: int) -> str:
-    """Clip string to n chars and add ellipsis if needed."""
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
-async def safe_edit_or_send(
-    update: Update,
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-    message=None,
-):
-    """
-    Edit the existing message if provided; otherwise send a new message.
-    Avoids failing on 'message is not modified' and markdown/HTML quirks.
-    """
+def _clamp_hour(h: int) -> int:
+    return max(0, min(24, h))
+
+def _within_hours(local_dt: datetime, start_h: int, end_h: int) -> bool:
+    """True if local time is within [start_h, end_h) with wrap-around and 24/7 support."""
+    h = local_dt.hour
+    if start_h == 0 and end_h == 24:
+        return True
+    start_h = _clamp_hour(start_h)
+    end_h = _clamp_hour(end_h)
+    if start_h == end_h:
+        return False
+    if start_h < end_h:
+        return start_h <= h < end_h
+    return h >= start_h or h < end_h
+
+async def safe_edit_or_send(update: Update, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None, message=None):
+    """Edit existing message or send new one; tolerate minor BadRequest cases."""
     try:
         if message:
             await message.edit_text(
@@ -98,7 +108,6 @@ async def safe_edit_or_send(
                 disable_web_page_preview=True,
             )
     except BadRequest:
-        # Fallback to sending a fresh message
         await update.effective_chat.send_message(
             text,
             reply_markup=reply_markup,
@@ -106,16 +115,17 @@ async def safe_edit_or_send(
             disable_web_page_preview=True,
         )
 
-
-# -----------------------------
+# =============================
 # DB (sync) -> run in executor
-# -----------------------------
+# =============================
 def _get_conn():
-    # Railway Postgres typically requires SSL; keep require. Change if your DB doesn't.
+    # Railway Postgres usually requires SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def _init_db_sync():
+    """Create/upgrade schema in a migration-safe order."""
     with _get_conn() as conn, conn.cursor() as c:
+        # Core tables
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS users(
@@ -139,9 +149,29 @@ def _init_db_sync():
             );
             """
         )
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);")
+        # Add new columns idempotently BEFORE creating indexes that depend on them
+        c.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_daily BOOLEAN DEFAULT TRUE;")
+        c.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_reset DATE DEFAULT CURRENT_DATE;")
+        c.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP NULL;")
 
-def _register_user_sync(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
+        # Settings table for per-user preferences
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings(
+                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                mute_reminders BOOLEAN DEFAULT FALSE,
+                work_start SMALLINT DEFAULT 9,   -- inclusive, 0..23
+                work_end SMALLINT DEFAULT 21     -- exclusive, 1..24 (24 means 24/7 with start=0)
+            );
+            """
+        )
+
+        # Indexes
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_pending ON tasks(user_id, is_done);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completed_at);")
+
+def _ensure_user_and_settings_sync(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
     with _get_conn() as conn, conn.cursor() as c:
         c.execute(
             """
@@ -154,14 +184,24 @@ def _register_user_sync(user_id: int, username: Optional[str], first_name: Optio
             """,
             (user_id, username, first_name, last_name),
         )
+        c.execute("INSERT INTO user_settings (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
 
 def _add_task_sync(admin_id: int, user_id: int, task_text: str):
     with _get_conn() as conn, conn.cursor() as c:
         c.execute("INSERT INTO tasks (admin_id, user_id, task_text) VALUES (%s, %s, %s)", (admin_id, user_id, task_text))
 
 def _toggle_task_sync(task_id: int, user_id: int):
+    """Toggle task status and set/clear completed_at accordingly."""
     with _get_conn() as conn, conn.cursor() as c:
-        c.execute("UPDATE tasks SET is_done = NOT is_done WHERE task_id = %s AND user_id = %s", (task_id, user_id))
+        c.execute("SELECT is_done FROM tasks WHERE task_id=%s AND user_id=%s", (task_id, user_id))
+        row = c.fetchone()
+        if not row:
+            return
+        current = row[0]
+        if current:
+            c.execute("UPDATE tasks SET is_done = FALSE, completed_at = NULL WHERE task_id=%s AND user_id=%s", (task_id, user_id))
+        else:
+            c.execute("UPDATE tasks SET is_done = TRUE, completed_at = NOW() AT TIME ZONE 'UTC' WHERE task_id=%s AND user_id=%s", (task_id, user_id))
 
 def _delete_task_sync(task_id: int):
     with _get_conn() as conn, conn.cursor() as c:
@@ -215,23 +255,130 @@ def _get_global_stats_sync():
         users_cnt, tasks_cnt, done_cnt = c.fetchone()
         return users_cnt, tasks_cnt, done_cnt
 
+def _get_pending_grouped_sync(limit_per_user: int = 5) -> List[Tuple[int, int, List[str]]]:
+    """Return [(user_id, pending_count, sample_texts<=limit_per_user), ...]"""
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute(
+            """
+            SELECT user_id, task_text
+            FROM tasks
+            WHERE is_done = FALSE
+            ORDER BY created_date ASC
+            """
+        )
+        rows = c.fetchall()
+    grouped: Dict[int, Tuple[int, List[str]]] = {}
+    for user_id, task_text in rows:
+        if user_id not in grouped:
+            grouped[user_id] = (0, [])
+        cnt, samples = grouped[user_id]
+        cnt += 1
+        if len(samples) < limit_per_user:
+            samples.append(task_text)
+        grouped[user_id] = (cnt, samples)
+    return [(uid, data[0], data[1]) for uid, data in grouped.items()]
+
+def _get_all_settings_map_sync() -> Dict[int, Tuple[bool, int, int]]:
+    """Returns {user_id: (mute_reminders, work_start, work_end)}."""
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute(
+            """
+            SELECT u.user_id,
+                   COALESCE(s.mute_reminders, FALSE) AS mute_reminders,
+                   COALESCE(s.work_start, 9) AS work_start,
+                   COALESCE(s.work_end, 21) AS work_end
+            FROM users u
+            LEFT JOIN user_settings s ON s.user_id = u.user_id
+            """
+        )
+        rows = c.fetchall()
+    return {r[0]: (bool(r[1]), int(r[2]), int(r[3])) for r in rows}
+
+def _get_user_settings_sync(user_id: int) -> Tuple[bool, int, int]:
+    """Fetch user's settings, ensure defaults exist."""
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO user_settings (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+        c.execute("SELECT mute_reminders, work_start, work_end FROM user_settings WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+    if not row:
+        return (False, 9, 21)
+    return (bool(row[0]), int(row[1]), int(row[2]))
+
+def _update_user_settings_sync(user_id: int, mute: Optional[bool] = None, start: Optional[int] = None, end: Optional[int] = None):
+    """Update settings selectively."""
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO user_settings (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+        sets = []
+        vals: List[object] = []
+        if mute is not None:
+            sets.append("mute_reminders=%s")
+            vals.append(mute)
+        if start is not None:
+            sets.append("work_start=%s")
+            vals.append(_clamp_hour(start))
+        if end is not None:
+            sets.append("work_end=%s")
+            vals.append(_clamp_hour(end))
+        if not sets:
+            return
+        q = f"UPDATE user_settings SET {', '.join(sets)} WHERE user_id=%s"
+        vals.append(user_id)
+        c.execute(q, tuple(vals))
+
+def _collect_yesterday_report_and_reset_sync(tz_name: str) -> List[Tuple[int, int, int]]:
+    """Build per-user report for yesterday (in given tz), then reset daily tasks."""
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz=tz)
+    today_local = now_local.date()
+    yesterday_local = today_local - timedelta(days=1)
+    y_start_local = datetime.combine(yesterday_local, time(0, 0), tzinfo=tz)
+    y_end_local = datetime.combine(today_local, time(0, 0), tzinfo=tz)
+    y_start_utc = y_start_local.astimezone(timezone.utc)
+    y_end_utc = y_end_local.astimezone(timezone.utc)
+
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute(
+            """
+            SELECT
+                u.user_id,
+                COALESCE(SUM(CASE WHEN t.is_daily THEN 1 ELSE 0 END), 0) AS total_daily,
+                COALESCE(SUM(CASE WHEN t.completed_at >= %s AND t.completed_at < %s THEN 1 ELSE 0 END), 0) AS completed_y
+            FROM users u
+            LEFT JOIN tasks t ON u.user_id = t.user_id
+            GROUP BY u.user_id
+            """,
+            (y_start_utc, y_end_utc),
+        )
+        report = c.fetchall()
+
+        c.execute(
+            """
+            UPDATE tasks
+            SET is_done = FALSE,
+                last_reset = CURRENT_DATE,
+                completed_at = NULL
+            WHERE is_daily = TRUE
+            """
+        )
+    return [(r[0], int(r[1] or 0), int(r[2] or 0)) for r in report]
+
 async def run_db(func, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(EXECUTOR, func, *args)
 
-
-# -----------------------------
-# UI / Menus (HTML parse mode)
-# -----------------------------
+# =============================
+# UI / Menus (HTML)
+# =============================
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None):
     user = update.effective_user
-    await run_db(_register_user_sync, user.id, user.username, user.first_name, user.last_name)
+    await run_db(_ensure_user_and_settings_sync, user.id, user.username, user.first_name, user.last_name)
 
     if is_admin(user.id, user.username):
         keyboard = [
             [InlineKeyboardButton("👥 Manage Users", callback_data="admin_users:0")],
             [InlineKeyboardButton("📊 Global Stats", callback_data="admin_stats")],
             [InlineKeyboardButton("✅ My Tasks", callback_data="my_tasks")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
         ]
         text = "<b>👑 Admin Panel — Main Menu</b>\n\nWhat do you want to do?"
@@ -241,6 +388,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
         keyboard = [
             [InlineKeyboardButton("✅ My Tasks", callback_data="my_tasks")],
             [InlineKeyboardButton("📊 My Status", callback_data="my_stats")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
         ]
         text = f"👋 <b>Hello {esc(user.first_name)}</b>\n\n📊 You have <b>{pending}</b> pending task(s)."
@@ -263,7 +411,7 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await update.message.reply_text(
-        f"ID: <code>{u.id}</code>\nUsername: <code>{esc(u.username or '')}</code>",
+        f"ID: <code>{u.id}</code>\nUsername: <code>{esc(u.username or '')}</code>\nTZ: <code>{esc(TZ_NAME)}</code>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -279,9 +427,11 @@ async def amadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_settings_menu(update)
+
 async def show_user_tasks_menu(update: Update, user_id: int, message=None):
     tasks = await run_db(_get_user_tasks_sync, user_id)
-
     if not tasks:
         text = "🎉 <b>No tasks!</b>\n\nYou’re all caught up."
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
@@ -293,7 +443,6 @@ async def show_user_tasks_menu(update: Update, user_id: int, message=None):
 
     lines = [f"📋 <b>Your Tasks</b>\n", f"📊 Status: ✅ {done} done | ⏳ {pending} pending\n"]
     keyboard = []
-
     for task_id, task_text, is_done, created_date in tasks[:40]:
         emoji = "✅" if is_done else "⏳"
         created_str = created_date.strftime("%Y-%m-%d %H:%M")
@@ -312,7 +461,6 @@ async def show_admin_users_menu(update: Update, message=None, page: int = 0, per
 
     lines = ["👥 <b>User Management</b>\n"]
     keyboard = []
-
     for user_id, first_name, username, task_count, done_count in users:
         uname = f"@{username}" if username else "no-username"
         progress = f"{done_count}/{task_count}" if task_count > 0 else "0"
@@ -321,12 +469,10 @@ async def show_admin_users_menu(update: Update, message=None, page: int = 0, per
             f"   📊 Progress: {esc(progress)} | 🆔: <code>{user_id}</code>\n"
             f"   ─────────────────"
         )
-        keyboard.append(
-            [
-                InlineKeyboardButton(f"👀 View {clip(first_name or str(user_id), 12)}", callback_data=f"view_user_{user_id}"),
-                InlineKeyboardButton("➕ New Task", callback_data=f"add_task_{user_id}"),
-            ]
-        )
+        keyboard.append([
+            InlineKeyboardButton(f"👀 View {clip(first_name or str(user_id), 12)}", callback_data=f"view_user_{user_id}"),
+            InlineKeyboardButton("➕ New Task", callback_data=f"add_task_{user_id}"),
+        ])
 
     nav_row = []
     if page > 0:
@@ -356,7 +502,6 @@ async def show_user_detail(update: Update, user_id: int, message=None):
         [InlineKeyboardButton("📊 View all tasks", callback_data=f"view_all_tasks_{user_id}")],
         [InlineKeyboardButton("🔙 Back", callback_data="admin_users:0")],
     ]
-
     await safe_edit_or_send(update, "\n".join(lines), InlineKeyboardMarkup(keyboard), message)
 
 async def show_stats(update: Update, message=None):
@@ -372,12 +517,11 @@ async def show_stats(update: Update, message=None):
         f"⏳ Pending: <b>{pending}</b>",
         f"📈 Progress: <b>{progress}%</b>\n",
     ]
-
     users = await run_db(_get_all_users_sync, 0, 50)
     top = []
-    for uid, first_name, username, task_count, done_count_ in users:
+    for uid, first_name, username, task_count, done_cnt_u in users:
         if task_count > 0:
-            pct = round(done_count_ * 100.0 / task_count, 1)
+            pct = round(done_cnt_u * 100.0 / task_count, 1)
             top.append((pct, first_name or str(uid)))
     top.sort(reverse=True)
     if top:
@@ -393,7 +537,8 @@ async def show_help(update: Update, message=None):
         "ℹ️ <b>Task Manager Bot — Help</b>\n\n"
         "🎯 <b>Users:</b>\n"
         "• ✅ My Tasks — view & toggle tasks\n"
-        "• 📊 My Status — quick stats\n\n"
+        "• 📊 My Status — quick stats\n"
+        "• ⚙️ Settings — mute reminders & working hours\n\n"
         "👑 <b>Admins:</b>\n"
         "• 👥 Manage Users — browse users, add tasks\n"
         "• 📊 Global Stats — overall metrics\n\n"
@@ -401,16 +546,50 @@ async def show_help(update: Update, message=None):
         "/start — main menu\n"
         "/mytasks — my tasks\n"
         "/users — user management (admins)\n"
+        "/settings — user settings\n"
         "/whoami — show your Telegram ID/username\n"
         "/amadmin — check admin recognition\n"
     )
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]
     await safe_edit_or_send(update, text, InlineKeyboardMarkup(keyboard), message)
 
+# =============================
+# Settings UI
+# =============================
+async def show_settings_menu(update: Update, message=None):
+    u = update.effective_user
+    mute, start_h, end_h = await run_db(_get_user_settings_sync, u.id)
+    state = "ON 🔕" if mute else "OFF 🔔"
+    tz_line = f"Time zone: <code>{esc(TZ_NAME)}</code>"
+    hours_line = f"Working hours: <b>{start_h:02d}:00–{end_h:02d}:00</b>" if not (start_h == 0 and end_h == 24) else "Working hours: <b>24/7</b>"
+    text = (
+        "⚙️ <b>User Settings</b>\n\n"
+        f"{tz_line}\n"
+        f"Mute reminders: <b>{state}</b>\n"
+        f"{hours_line}\n\n"
+        "Use the buttons to toggle mute or adjust hours."
+    )
+    keyboard = [
+        [InlineKeyboardButton("🔕 Toggle Mute", callback_data="toggle_mute")],
+        [
+            InlineKeyboardButton("⏮ Start −1h", callback_data="start_dec"),
+            InlineKeyboardButton("Start +1h ⏭", callback_data="start_inc"),
+        ],
+        [
+            InlineKeyboardButton("⏮ End −1h", callback_data="end_dec"),
+            InlineKeyboardButton("End +1h ⏭", callback_data="end_inc"),
+        ],
+        [
+            InlineKeyboardButton("Preset 9–21", callback_data="preset_9_21"),
+            InlineKeyboardButton("Preset 24/7", callback_data="preset_24_7"),
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
+    ]
+    await safe_edit_or_send(update, text, InlineKeyboardMarkup(keyboard), message)
 
-# -----------------------------
+# =============================
 # Callbacks / Messages
-# -----------------------------
+# =============================
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -419,8 +598,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    # Clear add-task state if navigating away
-    if data in ("main_menu", "admin_stats", "help") or data.startswith("admin_users"):
+    if data in ("main_menu", "admin_stats", "help", "settings") or data.startswith("admin_users"):
         context.user_data.pop("target_user_id", None)
 
     if data == "main_menu":
@@ -450,6 +628,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "help":
         await show_help(update, query.message)
+
+    elif data == "settings":
+        await show_settings_menu(update, query.message)
 
     elif data.startswith("complete_"):
         task_id = int(data.split("_")[1])
@@ -488,6 +669,45 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text("❌ Access denied.")
 
+    # Settings actions
+    elif data == "toggle_mute":
+        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
+        await run_db(_update_user_settings_sync, user_id, not mute, None, None)
+        await show_settings_menu(update, query.message)
+
+    elif data == "start_inc":
+        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
+        await run_db(_update_user_settings_sync, user_id, None, (start_h + 1) % 24, None)
+        await show_settings_menu(update, query.message)
+
+    elif data == "start_dec":
+        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
+        await run_db(_update_user_settings_sync, user_id, None, (start_h - 1) % 24, None)
+        await show_settings_menu(update, query.message)
+
+    elif data == "end_inc":
+        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
+        end_h = (end_h + 1) % 25
+        end_h = 24 if end_h == 0 else end_h
+        await run_db(_update_user_settings_sync, user_id, None, None, end_h)
+        await show_settings_menu(update, query.message)
+
+    elif data == "end_dec":
+        mute, start_h, end_h = await run_db(_get_user_settings_sync, user_id)
+        end_h = end_h - 1
+        if end_h < 1:
+            end_h = 24
+        await run_db(_update_user_settings_sync, user_id, None, None, end_h)
+        await show_settings_menu(update, query.message)
+
+    elif data == "preset_9_21":
+        await run_db(_update_user_settings_sync, user_id, None, 9, 21)
+        await show_settings_menu(update, query.message)
+
+    elif data == "preset_24_7":
+        await run_db(_update_user_settings_sync, user_id, None, 0, 24)
+        await show_settings_menu(update, query.message)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle free text when in add-task mode."""
     user = update.effective_user
@@ -514,12 +734,176 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("ℹ️ Use menu buttons to add tasks.", parse_mode=ParseMode.HTML)
 
+# =============================
+# Jobs (PTB JobQueue + asyncio fallback)
+# =============================
+async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Every 2 hours: ping users with pending tasks, respecting settings."""
+    try:
+        pending_list = await run_db(_get_pending_grouped_sync, 5)
+        settings_map = await run_db(_get_all_settings_map_sync)
+        bot = context.application.bot
+        now_local = datetime.now(tz=TZ)
 
-# -----------------------------
+        for user_id, count_pending, samples in pending_list:
+            mute, w_start, w_end = settings_map.get(user_id, (False, 9, 21))
+            if mute:
+                continue
+            if not _within_hours(now_local, w_start, w_end):
+                continue
+            try:
+                lines = [
+                    f"⏰ <b>Reminder</b>",
+                    f"You have <b>{count_pending}</b> pending task(s).",
+                ]
+                if samples:
+                    lines.append("Top items:")
+                    for s in samples:
+                        lines.append(f"• {esc(s)}")
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Open My Tasks", callback_data="my_tasks")],
+                    [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+                ])
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="\n".join(lines),
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except (Forbidden, BadRequest):
+                continue
+    except Exception:
+        pass
+
+async def job_midnight_rollover(context: ContextTypes.DEFAULT_TYPE):
+    """After midnight: send daily performance report, then reset daily tasks."""
+    try:
+        report = await run_db(_collect_yesterday_report_and_reset_sync, TZ_NAME)
+        bot = context.application.bot
+
+        for user_id, total_daily, completed_y in report:
+            try:
+                pct = round((completed_y / total_daily) * 100, 1) if total_daily > 0 else 0.0
+                now_local = datetime.now(tz=TZ)
+                y_date = (now_local.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+                text = (
+                    f"📅 <b>Daily Report — {y_date}</b>\n"
+                    f"✅ Completed: <b>{completed_y}</b>\n"
+                    f"📝 Total daily tasks: <b>{total_daily}</b>\n"
+                    f"📈 Performance: <b>{pct}%</b>\n\n"
+                    f"🔄 New day started — tasks refreshed."
+                )
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except (Forbidden, BadRequest):
+                continue
+
+        # Optional admin aggregate
+        admins = list(ADMINS_BY_ID)
+        if admins:
+            total_users = await run_db(_get_users_count_sync)
+            total_completed = sum(x[2] for x in report)
+            total_tasks = sum(x[1] for x in report)
+            pct_all = round((total_completed / total_tasks) * 100, 1) if total_tasks > 0 else 0.0
+            summary = (
+                f"🧾 <b>Daily Summary</b>\n"
+                f"👥 Users: <b>{total_users}</b>\n"
+                f"✅ Completed (yesterday): <b>{total_completed}</b>\n"
+                f"📝 Total daily tasks: <b>{total_tasks}</b>\n"
+                f"📈 Performance: <b>{pct_all}%</b>"
+            )
+            for admin_id in admins:
+                try:
+                    await context.application.bot.send_message(
+                        chat_id=admin_id,
+                        text=summary,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except (Forbidden, BadRequest):
+                    continue
+    except Exception:
+        pass
+
+# ---------- AsyncIO fallback scheduling ----------
+
+def _seconds_until_next_even_hour(now_local: datetime) -> float:
+    """Compute seconds until the next even-hour at minute 00 in local TZ."""
+    hour = now_local.hour
+    next_hour = (hour + (2 - (hour % 2))) % 24
+    day = now_local.date()
+    if next_hour <= hour:
+        day = day + timedelta(days=1)
+    candidate = datetime.combine(day, time(next_hour, 0), tzinfo=TZ)
+    delta = (candidate - now_local).total_seconds()
+    return max(1.0, delta)
+
+def _seconds_until_local(h: int, m: int, now_local: Optional[datetime] = None) -> float:
+    """Compute seconds until the next occurrence of local time h:m."""
+    now_local = now_local or datetime.now(tz=TZ)
+    candidate = datetime.combine(now_local.date(), time(h, m), tzinfo=TZ)
+    if candidate <= now_local:
+        candidate = candidate + timedelta(days=1)
+    return max(1.0, (candidate - now_local).total_seconds())
+
+async def _reminders_loop(app: Application):
+    """Fallback loop that runs reminders every 2 hours at :00 in local TZ."""
+    print("[SCHED] AsyncIO reminders loop active")
+    ctx = SimpleNamespace(application=app)
+    while True:
+        now_local = datetime.now(tz=TZ)
+        sleep_sec = _seconds_until_next_even_hour(now_local)
+        await asyncio.sleep(sleep_sec)
+        try:
+            await job_send_reminders(ctx)
+        except Exception:
+            pass
+
+async def _midnight_loop(app: Application):
+    """Fallback loop that runs the daily rollover at 00:05 local TZ."""
+    print("[SCHED] AsyncIO midnight loop active")
+    ctx = SimpleNamespace(application=app)
+    while True:
+        sleep_sec = _seconds_until_local(0, 5)
+        await asyncio.sleep(sleep_sec)
+        try:
+            await job_midnight_rollover(ctx)
+        except Exception:
+            pass
+
+def _schedule_jobs(job_queue: Optional[JobQueue], app: Application):
+    """Schedule jobs via PTB JobQueue if available; otherwise use asyncio fallback."""
+    if job_queue is not None:
+        # PTB JobQueue path (requires 'python-telegram-bot[job-queue]')
+        print("[SCHED] Using PTB JobQueue")
+        # Reminders at every even hour local time
+        for h in range(0, 24, 2):
+            job_queue.run_daily(
+                job_send_reminders,
+                time=time(hour=h, minute=0, tzinfo=TZ),
+                name=f"reminder_{h:02d}",
+            )
+        # Midnight rollover 00:05 local
+        job_queue.run_daily(
+            job_midnight_rollover,
+            time=time(hour=0, minute=5, tzinfo=TZ),
+            name="midnight_rollover",
+        )
+    else:
+        # AsyncIO fallback loops
+        print("[SCHED] PTB JobQueue not available — using AsyncIO fallback")
+        app.create_task(_reminders_loop(app), name="reminders_loop")
+        app.create_task(_midnight_loop(app), name="midnight_loop")
+
+# =============================
 # Error handling
-# -----------------------------
+# =============================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    # Log the exception; on Railway logs are visible in dashboard.
     try:
         chat = None
         if isinstance(update, Update):
@@ -531,28 +915,29 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
             )
     except Exception:
-        pass  # Never raise from the error handler
+        pass
 
-
-# -----------------------------
+# =============================
 # App bootstrap
-# -----------------------------
+# =============================
 async def _init_db_once(app: Application):
     await run_db(_init_db_sync)
-    # Print admins to stdout for sanity check on Railway
+    print(f"[BOOT] TZ={TZ_NAME}")
     print(f"[BOOT] Admin IDs: {sorted(ADMINS_BY_ID)}")
     print(f"[BOOT] Admin Usernames: {sorted(ADMINS_BY_USERNAME)}")
+    _schedule_jobs(getattr(app, "job_queue", None), app)
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Initialize DB once the bot starts
+    # Initialize DB and schedule jobs after startup
     application.post_init = _init_db_once
 
     # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("mytasks", mytasks_cmd))
     application.add_handler(CommandHandler("users", users_cmd))
+    application.add_handler(CommandHandler("settings", settings_cmd))
     application.add_handler(CommandHandler("whoami", whoami_cmd))
     application.add_handler(CommandHandler("amadmin", amadmin_cmd))
 
@@ -567,7 +952,6 @@ def main():
 
     print("🤖 Task Manager Bot is running (polling).")
     application.run_polling(allowed_updates=["message", "callback_query"])
-
 
 if __name__ == "__main__":
     main()
