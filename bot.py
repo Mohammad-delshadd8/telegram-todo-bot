@@ -77,7 +77,7 @@ def _clamp_hour(h: int) -> int:
     return max(0, min(24, h))
 
 def _within_hours(local_dt: datetime, start_h: int, end_h: int) -> bool:
-    """True if local time is within [start_h, end_h) with wrap-around and 24/7 support."""
+    """Return True if local time is within [start_h, end_h) with wrap-around and 24/7 support."""
     h = local_dt.hour
     if start_h == 0 and end_h == 24:
         return True
@@ -90,7 +90,7 @@ def _within_hours(local_dt: datetime, start_h: int, end_h: int) -> bool:
     return h >= start_h or h < end_h
 
 async def safe_edit_or_send(update: Update, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None, message=None):
-    """Edit existing message or send new one; tolerate minor BadRequest cases."""
+    """Edit an existing message or send a new one; tolerate BadRequest from Telegram quirks."""
     try:
         if message:
             await message.edit_text(
@@ -118,7 +118,7 @@ async def safe_edit_or_send(update: Update, text: str, reply_markup: Optional[In
 # DB (sync) -> run in executor
 # =============================
 def _get_conn():
-    # Railway Postgres usually requires SSL
+    # Many hosted Postgres providers require SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def _init_db_sync():
@@ -211,6 +211,7 @@ def _toggle_task_sync(task_id: int, user_id: int):
         if current:
             c.execute("UPDATE tasks SET is_done = FALSE, completed_at = NULL WHERE task_id=%s AND user_id=%s", (task_id, user_id))
         else:
+            # Store in UTC so we can reliably convert to local when reporting
             c.execute("UPDATE tasks SET is_done = TRUE, completed_at = NOW() AT TIME ZONE 'UTC' WHERE task_id=%s AND user_id=%s", (task_id, user_id))
 
 def _delete_task_sync(task_id: int):
@@ -289,7 +290,7 @@ def _get_pending_grouped_sync(limit_per_user: int = 5) -> List[Tuple[int, int, L
     return [(uid, data[0], data[1]) for uid, data in grouped.items()]
 
 def _get_all_settings_map_sync() -> Dict[int, Tuple[bool, int, int]]:
-    """Returns {user_id: (mute_reminders, work_start, work_end)}."""
+    """Return {user_id: (mute_reminders, work_start, work_end)}."""
     with _get_conn() as conn, conn.cursor() as c:
         c.execute(
             """
@@ -385,6 +386,71 @@ async def is_admin_async(user_id: int, username: Optional[str]) -> bool:
     return await run_db(_is_admin_db_sync, user_id)
 
 # =============================
+# Daily report + daily reset
+# =============================
+def _collect_yesterday_report_and_reset_sync(tz_name: str):
+    """
+    Return per-user tuples (user_id, total_daily, completed_yesterday),
+    then reset daily tasks (is_daily=TRUE) once per local day.
+    We store completed_at in UTC; convert to local date for "yesterday".
+    """
+    with _get_conn() as conn, conn.cursor() as c:
+        # Local "today" date in the specified timezone
+        c.execute("SELECT (now() AT TIME ZONE %s)::date", (tz_name,))
+        today_local = c.fetchone()[0]
+        yesterday_local = today_local - timedelta(days=1)
+
+        # Aggregate totals and completed-yesterday per user
+        c.execute(
+            """
+            WITH daily AS (
+                SELECT user_id
+                FROM tasks
+                WHERE is_daily = TRUE
+                GROUP BY user_id
+            ),
+            totals AS (
+                SELECT user_id, COUNT(*) AS total_daily
+                FROM tasks
+                WHERE is_daily = TRUE
+                GROUP BY user_id
+            ),
+            done_y AS (
+                SELECT t.user_id, COUNT(*) AS completed_yesterday
+                FROM tasks t
+                WHERE t.is_daily = TRUE
+                  AND t.is_done = TRUE
+                  AND ((t.completed_at AT TIME ZONE 'UTC') AT TIME ZONE %s)::date = %s
+                GROUP BY t.user_id
+            )
+            SELECT d.user_id,
+                   COALESCE(tt.total_daily, 0) AS total_daily,
+                   COALESCE(dy.completed_yesterday, 0) AS completed_yesterday
+            FROM daily d
+            LEFT JOIN totals tt ON tt.user_id = d.user_id
+            LEFT JOIN done_y dy ON dy.user_id = d.user_id
+            ORDER BY d.user_id ASC
+            """,
+            (tz_name, yesterday_local),
+        )
+        rows = c.fetchall()
+
+        # Reset daily tasks once per local day based on last_reset
+        c.execute(
+            """
+            UPDATE tasks
+            SET is_done = FALSE,
+                completed_at = NULL,
+                last_reset = %s
+            WHERE is_daily = TRUE
+              AND (last_reset IS NULL OR last_reset < %s)
+            """,
+            (today_local, today_local),
+        )
+
+        return rows
+
+# =============================
 # UI / Menus (HTML)
 # =============================
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None):
@@ -467,6 +533,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_settings_menu(update)
 
 async def show_user_tasks_menu(update: Update, user_id: int, message=None):
+    """Render user's task list with toggle and delete per item."""
     tasks = await run_db(_get_user_tasks_sync, user_id)
     if not tasks:
         keyboard = []
@@ -486,9 +553,14 @@ async def show_user_tasks_menu(update: Update, user_id: int, message=None):
         emoji = "✅" if is_done else "⏳"
         created_str = created_date.strftime("%Y-%m-%d %H:%M")
         lines.append(f"{emoji} {esc(task_text)}  <i>({created_str})</i>")
-        label = f"{'✅ Done' if not is_done else '↩️ Undo'}: {clip(task_text, 15)}"
-        cb = f"{'complete' if not is_done else 'undo'}_{task_id}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+        toggle_label = f"{'✅ Done' if not is_done else '↩️ Undo'}: {clip(task_text, 15)}"
+        toggle_cb = f"{'complete' if not is_done else 'undo'}_{task_id}"
+        delete_label = "🗑 Delete"
+        delete_cb = f"delete_{task_id}"
+        keyboard.append([
+            InlineKeyboardButton(toggle_label, callback_data=toggle_cb),
+            InlineKeyboardButton(delete_label, callback_data=delete_cb),
+        ])
 
     if update.effective_user.id == user_id:
         keyboard.insert(0, [InlineKeyboardButton("➕ New Task", callback_data="add_self_task")])
@@ -682,6 +754,34 @@ async def show_settings_menu(update: Update, message=None):
     await safe_edit_or_send(update, text, InlineKeyboardMarkup(keyboard), message)
 
 # =============================
+# Message/Callback helpers for delete
+# =============================
+def _task_owner_sync(task_id: int) -> Optional[int]:
+    """Return the user_id who owns the task, or None if not found."""
+    with _get_conn() as conn, conn.cursor() as c:
+        c.execute("SELECT user_id FROM tasks WHERE task_id=%s", (task_id,))
+        row = c.fetchone()
+        return row[0] if row else None
+
+def _delete_task_owner_or_admin_sync(task_id: int, requester_id: int, is_admin: bool) -> bool:
+    """
+    Delete a task if:
+      - requester is the owner of the task, OR
+      - requester is admin (DB or ENV).
+    Returns True if a row was deleted.
+    """
+    with _get_conn() as conn, conn.cursor() as c:
+        # Try delete as the owner
+        c.execute("DELETE FROM tasks WHERE task_id=%s AND user_id=%s", (task_id, requester_id))
+        if c.rowcount > 0:
+            return True
+        # If not owner, allow admins to delete any
+        if is_admin:
+            c.execute("DELETE FROM tasks WHERE task_id=%s", (task_id,))
+            return c.rowcount > 0
+        return False
+
+# =============================
 # Callbacks / Messages
 # =============================
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -809,11 +909,26 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text("❌ Access denied.")
 
+    elif data.startswith("delete_"):
+        # Delete flow: determine owner (before delete) for proper refresh if admin
+        task_id = int(data.split("_")[1])
+        is_admin = await is_admin_async(user_id, username)
+        owner_id = await run_db(_task_owner_sync, task_id)
+        deleted = await run_db(_delete_task_owner_or_admin_sync, task_id, user_id, is_admin)
+        if deleted:
+            await query.answer("✅ Task deleted", show_alert=False)
+        else:
+            await query.answer("⚠️ Not allowed or task not found", show_alert=True)
+
+        target_refresh_id = owner_id if (owner_id and is_admin) else user_id
+        await show_user_tasks_menu(update, target_refresh_id, query.message)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle free text for:
-       - admin adding task to a target user
-       - admin adding admin by ID
-       - user adding own task
+    """
+    Handle free text for:
+      - admin adding task to a specific target user
+      - admin adding admin by ID
+      - user adding own task
     """
     u = update.effective_user
     text = (update.message.text or "").strip()
@@ -881,7 +996,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Use the menu. Tip: press “➕ New Task” to add one.", parse_mode=ParseMode.HTML)
 
 # =============================
-# Jobs (asyncio fallback scheduler)
+# Jobs (asyncio scheduler)
 # =============================
 async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Every 2 hours: ping users with pending tasks, respecting settings."""
@@ -921,7 +1036,7 @@ async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def job_midnight_rollover(context: ContextTypes.DEFAULT_TYPE):
-    """After midnight: send daily performance report, then reset daily tasks."""
+    """At local midnight: send daily performance report (for yesterday), then reset daily tasks."""
     try:
         report = await run_db(_collect_yesterday_report_and_reset_sync, TZ_NAME)
         bot = context.application.bot
@@ -947,6 +1062,7 @@ async def job_midnight_rollover(context: ContextTypes.DEFAULT_TYPE):
             except (Forbidden, BadRequest):
                 continue
 
+        # Optional: send an aggregate summary to ENV admins
         admins = list(ADMINS_BY_ID)
         if admins:
             total_users = await run_db(_get_users_count_sync)
@@ -1005,11 +1121,11 @@ async def _reminders_loop(app: Application):
             pass
 
 async def _midnight_loop(app: Application):
-    """AsyncIO loop: daily rollover at 00:05 local time."""
+    """AsyncIO loop: daily rollover at 00:00 local time."""
     print("[SCHED] AsyncIO midnight loop active")
     ctx = SimpleNamespace(application=app)
     while True:
-        sleep_sec = _seconds_until_local(0, 5)
+        sleep_sec = _seconds_until_local(0, 0)  # run exactly at 00:00 local time
         await asyncio.sleep(sleep_sec)
         try:
             await job_midnight_rollover(ctx)
